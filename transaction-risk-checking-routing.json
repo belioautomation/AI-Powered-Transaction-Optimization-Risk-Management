@@ -1,0 +1,377 @@
+{
+  "name": "Transaction Risk Checking and Routing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "transaction-risk-check",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook - Transaction",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "transaction-risk-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json.body ?? $json;\nconst required = ['customer_id', 'amount', 'currency'];\nconst missing = required.filter(f => input[f] === undefined || input[f] === null || input[f] === '');\nif (missing.length) return [{json: {valid:false,error:'Missing required fields',missing_fields:missing}}];\nconst amount = Number(input.amount);\nif (!Number.isFinite(amount) || amount <= 0) return [{json:{valid:false,error:'Invalid transaction amount'}}];\nconst currency = String(input.currency).trim().toUpperCase();\nif (!/^[A-Z]{3}$/.test(currency)) return [{json:{valid:false,error:'Invalid currency'}}];\nreturn [{json:{valid:true,customer_id:String(input.customer_id).trim(),amount:Number(amount.toFixed(2)),currency,\nmerchant_id:input.merchant_id?String(input.merchant_id).trim():null,\npayment_method:input.payment_method?String(input.payment_method).trim().toLowerCase():null,\ncountry:input.country?String(input.country).trim().toUpperCase():null,\nip_address:input.ip_address?String(input.ip_address).trim():null,\ntransaction_timestamp:input.transaction_timestamp?new Date(input.transaction_timestamp).toISOString():new Date().toISOString()}}];"
+      },
+      "id": "2",
+      "name": "Normalize & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst data = $json;\nconst transactionId = `TXN-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;\nconst fingerprintSource = [data.customer_id,data.amount.toFixed(2),data.currency,data.merchant_id ?? '',data.payment_method ?? '',data.transaction_timestamp].join('|');\nconst transactionFingerprint = crypto.createHash('sha256').update(fingerprintSource).digest('hex');\nreturn [{json:{...data,transaction_id:transactionId,transaction_fingerprint:transactionFingerprint}}];"
+      },
+      "id": "3",
+      "name": "Generate Transaction ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT transaction_id, customer_id, amount, transaction_timestamp FROM transactions WHERE transaction_fingerprint = $1 LIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [$json.transaction_fingerprint] }}"
+        }
+      },
+      "id": "4",
+      "name": "PostgreSQL - Check Duplicate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        680,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT transaction_id, amount, currency, merchant_id, payment_method, country, transaction_timestamp, status, risk_score FROM transactions WHERE customer_id = $1 ORDER BY transaction_timestamp DESC LIMIT 20;",
+        "options": {
+          "queryReplacement": "={{ [$json.customer_id] }}"
+        }
+      },
+      "id": "5",
+      "name": "PostgreSQL - Customer History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        680,
+        120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const tx = $('Generate Transaction ID').first().json;\nconst duplicateRows = $('PostgreSQL - Check Duplicate').all();\nconst history = $('PostgreSQL - Customer History').all();\nconst duplicate = duplicateRows.length > 0;\nconst transactions = history.map(i => i.json);\nconst totalPrevious = transactions.length;\nconst totalPreviousAmount = transactions.reduce((sum,t) => sum + Number(t.amount || 0),0);\nconst averageAmount = totalPrevious ? totalPreviousAmount / totalPrevious : 0;\nconst amountDeviation = averageAmount > 0 ? Number(tx.amount) / averageAmount : null;\nconst flags = [];\nif (duplicate) flags.push('DUPLICATE_TRANSACTION');\nif (Number(tx.amount) >= 50000) flags.push('HIGH_VALUE_TRANSACTION');\nif (amountDeviation !== null && amountDeviation >= 5) flags.push('AMOUNT_MUCH_HIGHER_THAN_HISTORY');\nif (tx.country && tx.country !== 'PH') flags.push('FOREIGN_COUNTRY');\nreturn [{json:{...tx,duplicate,customer_history_count:totalPrevious,customer_average_amount:Number(averageAmount.toFixed(2)),amount_deviation:amountDeviation !== null ? Number(amountDeviation.toFixed(2)) : null,rule_flags:flags,customer_history:transactions}}];"
+      },
+      "id": "6",
+      "name": "Calculate Risk Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json;\nconst score = Number(data.ai_risk_score || 0);\nconst duplicate = Boolean(data.duplicate);\nconst flags = Array.isArray(data.rule_flags) ? data.rule_flags : [];\nlet finalStatus, decision, reason;\nif (duplicate) { finalStatus='HOLD'; decision='BLOCK_DUPLICATE'; reason='Duplicate transaction detected'; }\nelse if (flags.includes('HIGH_VALUE_TRANSACTION') && score >= 70) { finalStatus='HOLD'; decision='BLOCK_HIGH_RISK'; reason='High-value transaction with high AI risk score'; }\nelse if (score >= 70) { finalStatus='HOLD'; decision='BLOCK_HIGH_RISK'; reason='Transaction exceeded high-risk threshold'; }\nelse if (score >= 30) { finalStatus='MANUAL_REVIEW'; decision='REVIEW'; reason='Transaction requires manual review'; }\nelse { finalStatus='APPROVED'; decision='ALLOW'; reason='Transaction passed automated risk checks'; }\nreturn [{json:{...data,final_status:finalStatus,decision,decision_reason:reason,processed_at:new Date().toISOString()}}];"
+      },
+      "id": "7",
+      "name": "Final Risk Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO transactions (transaction_id,transaction_fingerprint,customer_id,amount,currency,merchant_id,payment_method,country,ip_address,transaction_timestamp,status,risk_score,risk_level,duplicate)\nVALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)\nON CONFLICT (transaction_id) DO UPDATE SET status=EXCLUDED.status,risk_score=EXCLUDED.risk_score,risk_level=EXCLUDED.risk_level,duplicate=EXCLUDED.duplicate;",
+        "options": {
+          "queryReplacement": "={{ [$json.transaction_id,$json.transaction_fingerprint,$json.customer_id,$json.amount,$json.currency,$json.merchant_id,$json.payment_method,$json.country,$json.ip_address,$json.transaction_timestamp,$json.final_status,$json.ai_risk_score,$json.ai_risk_level,$json.duplicate] }}"
+        }
+      },
+      "id": "8",
+      "name": "PostgreSQL - Store Transaction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1360,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO transaction_decisions (transaction_id,customer_id,risk_score,risk_level,duplicate,decision,reason,ai_reason,rule_flags)\nVALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [$json.transaction_id,$json.customer_id,$json.ai_risk_score,$json.ai_risk_level,$json.duplicate,$json.final_status,$json.decision_reason,$json.ai_reason,JSON.stringify($json.rule_flags || [])] }}"
+        }
+      },
+      "id": "9",
+      "name": "PostgreSQL - Log Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1580,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "alert-condition",
+              "leftValue": "={{ $json.final_status }}",
+              "rightValue": "HOLD",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "10",
+      "name": "Should Alert",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "\ud83d\udea8 TRANSACTION RISK ALERT\n\nTransaction: {{$json.transaction_id}}\nCustomer: {{$json.customer_id}}\nAmount: {{$json.amount}} {{$json.currency}}\nStatus: {{$json.final_status}}\nRisk Score: {{$json.ai_risk_score}}/100\nRisk Level: {{$json.ai_risk_level}}\nDuplicate: {{$json.duplicate ? 'YES' : 'NO'}}\n\nReason:\n{{$json.decision_reason}}\n\nAI Analysis:\n{{$json.ai_reason}}\n\nTime:\n{{$json.processed_at}}",
+        "additionalFields": {}
+      },
+      "id": "11",
+      "name": "Telegram - Risk Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2020,
+        -120
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, transaction_id: $json.transaction_id, status: $json.final_status, risk: { score: $json.ai_risk_score, level: $json.ai_risk_level, confidence: $json.ai_confidence }, duplicate: $json.duplicate, decision: $json.decision, reason: $json.decision_reason, processed_at: $json.processed_at } }}",
+        "options": {}
+      },
+      "id": "12",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        2240,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Transaction": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate": {
+      "main": [
+        [
+          {
+            "node": "Generate Transaction ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Transaction ID": {
+      "main": [
+        [
+          {
+            "node": "PostgreSQL - Check Duplicate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PostgreSQL - Customer History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PostgreSQL - Check Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Calculate Risk Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PostgreSQL - Customer History": {
+      "main": [
+        [
+          {
+            "node": "Calculate Risk Signals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Risk Signals": {
+      "main": [
+        [
+          {
+            "node": "Final Risk Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Risk Decision": {
+      "main": [
+        [
+          {
+            "node": "PostgreSQL - Store Transaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PostgreSQL - Store Transaction": {
+      "main": [
+        [
+          {
+            "node": "PostgreSQL - Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PostgreSQL - Log Decision": {
+      "main": [
+        [
+          {
+            "node": "Should Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Alert": {
+      "main": [
+        [
+          {
+            "node": "Telegram - Risk Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram - Risk Alert": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "transaction-risk-v1"
+}
